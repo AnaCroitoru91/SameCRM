@@ -79,7 +79,7 @@ try {
   console.error(err.stack);
 }
 
-const publicPath = path.join(__dirname, 'public');
+const publicPath = __dirname;
 app.use(express.static(publicPath));
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
