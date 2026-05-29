@@ -18,7 +18,10 @@ router.get('/', (req, res) => {
     if (responsible) { query += ' AND d.responsible = ?'; params.push(responsible); }
     const deals = db.prepare(query).all(...params);
     const getDealMarkets = db.prepare('SELECT * FROM deal_markets WHERE deal_id = ?');
-    let enriched = deals.map(d => ({ ...d, markets: getDealMarkets.all(d.id) }));
+    let enriched = deals.map(d => ({
+  ...d,
+  markets: getDealMarkets.all(d.id).map(m => `${m.market} (${m.stage})`).join(', ')
+}));
     if (market || stage) {
       enriched = enriched.filter(d => d.markets.some(m => (!market || m.market === market) && (!stage || m.stage === stage)));
     }
