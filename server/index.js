@@ -1,107 +1,83 @@
 'use strict';
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err.message);
-  console.error(err.stack);
-  process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('UNHANDLED REJECTION:', reason);
-  process.exit(1);
-});
+process.on('uncaughtException', (err) => { console.error('UNCAUGHT EXCEPTION:', err.message); console.error(err.stack); process.exit(1); });
+process.on('unhandledRejection', (reason) => { console.error('UNHANDLED REJECTION:', reason); process.exit(1); });
 
-console.log('Starting SameCRM...');
-console.log('Node version:', process.version);
-console.log('PORT env:', process.env.PORT);
+console.log('Starting SameCRM...'); console.log('Node version:', process.version); console.log('PORT env:', process.env.PORT);
 
 const express = require('express');
 const session = require('express-session');
 const cors = require('cors');
 const path = require('path');
+const cookieParser = require('cookie-parser');
+const { initDb, runSeed, getDb } = require('./db');
 
 let cron;
-try {
-  cron = require('node-cron');
-} catch(e) {
-  console.warn('node-cron failed to load:', e.message);
-}
-
-const { initDb, runSeed } = require('./db');
+try { cron = require('node-cron'); } catch (e) { console.warn('node-cron failed:', e.message); }
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-app.use((req, res, next) => {
-  res.removeHeader('X-Frame-Options');
-  res.setHeader('Content-Security-Policy', "frame-ancestors *");
-  next();
-});
-
+app.use((req, res, next) => { res.removeHeader('X-Frame-Options'); res.setHeader('Content-Security-Policy', "frame-ancestors *"); next(); });
+app.use(cookieParser());
 app.use(express.json());
-app.use(cors({
-  origin: true,
-  credentials: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-User-Id'],
-}));
-
+app.use(cors({ origin: true, credentials: true, methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','X-User-Id'] }));
 app.set('trust proxy', 1);
-app.use(session({
-  secret: 'samecrm-secret-key-2026',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    httpOnly: true,
-    sameSite: 'none',
-    secure: true
-  }
-}));
+app.use(session({ secret: 'samecrm-secret-key-2026', resave: false, saveUninitialized: false, cookie: { maxAge: 7*24*60*60*1000, httpOnly: true, sameSite: 'none', secure: true } }));
 
-try {
-  initDb();
-  runSeed();
-  console.log('Database ready');
-} catch (err) {
-  console.error('DB init error:', err.message);
-}
+try { initDb(); runSeed(); console.log('Database ready'); } catch (err) { console.error('DB init error:', err.message); }
 
-try {
-  app.use('/api/auth', require('./routes/auth'));
-  app.use('/api/accounts', require('./routes/accounts'));
-  app.use('/api/deals', require('./routes/deals'));
-  app.use('/api/tasks', require('./routes/tasks'));
-  app.use('/api/notes', require('./routes/notes'));
-  app.use('/api/users', require('./routes/users'));
-  app.use('/api/prospecting', require('./routes/prospecting'));
-  console.log('All routes loaded');
-} catch (err) {
-  console.error('Route loading error:', err.message);
-  console.error(err.stack);
-}
+app.use('/api/auth', require('./routes/auth'));
+
+app.get('/api/accounts', (req, res) => { try { const db = getDb(); const accounts = db.prepare(`SELECT a.*, COUNT(DISTINCT c.id) AS contact_count, COUNT(DISTINCT d.id) AS deal_count FROM accounts a LEFT JOIN contacts c ON c.account_id=a.id LEFT JOIN deals d ON d.account_id=a.id GROUP BY a.id ORDER BY a.name`).all(); const getOwners = db.prepare(`SELECT DISTINCT u.id,u.name,u.color FROM deals d JOIN users u ON u.id=d.responsible WHERE d.account_id=?`); const getMarkets = db.prepare(`SELECT dm.market,dm.stage FROM deals d JOIN deal_markets dm ON dm.deal_id=d.id WHERE d.account_id=?`); res.json(accounts.map(a => ({...a, owners: getOwners.all(a.id), markets: getMarkets.all(a.id)}))); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post('/api/accounts', (req, res) => { try { const db = getDb(); const { name, website, contacts=[] } = req.body; if (!name) return res.status(400).json({ error: 'name required' }); const tx = db.transaction(() => { const id = db.prepare('INSERT INTO accounts (name,website) VALUES (?,?)').run(name, website||null).lastInsertRowid; for (const c of contacts) db.prepare('INSERT INTO contacts (account_id,name,role,email) VALUES (?,?,?,?)').run(id, c.name, c.role||null, c.email||null); return db.prepare('SELECT * FROM accounts WHERE id=?').get(id); }); res.status(201).json(tx()); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.get('/api/accounts/:id', (req, res) => { try { const db = getDb(); const a = db.prepare('SELECT * FROM accounts WHERE id=?').get(req.params.id); if (!a) return res.status(404).json({ error: 'Not found' }); a.contacts = db.prepare('SELECT * FROM contacts WHERE account_id=?').all(a.id); a.deals = db.prepare('SELECT d.*,u.name AS responsible_name,u.color AS responsible_color FROM deals d JOIN users u ON u.id=d.responsible WHERE d.account_id=?').all(a.id).map(d => ({...d, markets: db.prepare('SELECT * FROM deal_markets WHERE deal_id=?').all(d.id)})); res.json(a); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.put('/api/accounts/:id', (req, res) => { try { const db = getDb(); const { name, website, contacts } = req.body; const tx = db.transaction(() => { db.prepare(`UPDATE accounts SET name=COALESCE(?,name),website=COALESCE(?,website),updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(name||null, website||null, req.params.id); if (Array.isArray(contacts)) { db.prepare('DELETE FROM contacts WHERE account_id=?').run(req.params.id); for (const c of contacts) db.prepare('INSERT INTO contacts (account_id,name,role,email) VALUES (?,?,?,?)').run(req.params.id, c.name, c.role||null, c.email||null); } return db.prepare('SELECT * FROM accounts WHERE id=?').get(req.params.id); }); res.json(tx()); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+const FOLLOWUP_DAYS = {'Sent Offer':7,'Follow-up Call':30,'Sent Contract':3,'Meeting Held':7,'No Response':14,'Negotiation Round':5,'Intro Email':7,'Other':7};
+app.get('/api/deals', (req, res) => { try { const db = getDb(); const { responsible, market, stage } = req.query; let q = `SELECT d.*,a.name AS account_name,u.name AS responsible_name,u.color AS responsible_color FROM deals d JOIN accounts a ON a.id=d.account_id JOIN users u ON u.id=d.responsible WHERE 1=1`; const p = []; if (responsible) { q += ' AND d.responsible=?'; p.push(responsible); } let deals = db.prepare(q).all(...p).map(d => ({...d, markets: db.prepare('SELECT * FROM deal_markets WHERE deal_id=?').all(d.id)})); if (market||stage) deals = deals.filter(d => d.markets.some(m => (!market||m.market===market)&&(!stage||m.stage===stage))); res.json(deals); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post('/api/deals', (req, res) => { try { const db = getDb(); const { account_id, responsible, type_of_goods, competition, markets=[] } = req.body; if (!account_id||!responsible) return res.status(400).json({ error: 'account_id and responsible required' }); const tx = db.transaction(() => { const id = db.prepare('INSERT INTO deals (account_id,responsible,type_of_goods,competition) VALUES (?,?,?,?)').run(account_id, responsible, type_of_goods||null, competition||null).lastInsertRowid; for (const m of markets) db.prepare('INSERT INTO deal_markets (deal_id,market,stage,est_volume,est_sameday_volume) VALUES (?,?,?,?,?)').run(id, m.market, m.stage||'Lead', m.est_volume||0, m.est_sameday_volume||0); return db.prepare(`SELECT d.*,a.name AS account_name,u.name AS responsible_name,u.color AS responsible_color FROM deals d JOIN accounts a ON a.id=d.account_id JOIN users u ON u.id=d.responsible WHERE d.id=?`).get(id); }); res.status(201).json(tx()); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.put('/api/deals/:id', (req, res) => { try { const db = getDb(); const { responsible, type_of_goods, competition } = req.body; db.prepare(`UPDATE deals SET responsible=COALESCE(?,responsible),type_of_goods=COALESCE(?,type_of_goods),competition=COALESCE(?,competition),updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(responsible||null, type_of_goods||null, competition||null, req.params.id); res.json(db.prepare('SELECT * FROM deals WHERE id=?').get(req.params.id)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.put('/api/deals/:id/markets/:marketId', (req, res) => { try { const db = getDb(); const { stage, last_action, go_live_date, est_volume, est_sameday_volume } = req.body; db.prepare(`UPDATE deal_markets SET stage=COALESCE(?,stage),last_action=COALESCE(?,last_action),go_live_date=COALESCE(?,go_live_date),est_volume=COALESCE(?,est_volume),est_sameday_volume=COALESCE(?,est_sameday_volume) WHERE id=?`).run(stage||null, last_action||null, go_live_date||null, est_volume!==undefined?est_volume:null, est_sameday_volume!==undefined?est_sameday_volume:null, req.params.marketId); res.json(db.prepare('SELECT * FROM deal_markets WHERE id=?').get(req.params.marketId)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post('/api/deals/:id/log-action', (req, res) => { try { const db = getDb(); const { market, actionType, notes, autoFollowup } = req.body; if (!market||!actionType) return res.status(400).json({ error: 'market and actionType required' }); const today = new Date().toISOString().split('T')[0]; db.prepare(`UPDATE deal_markets SET last_action=?,last_action_date=? WHERE deal_id=? AND market=?`).run(actionType, today, req.params.id, market); let task = null; if (autoFollowup) { const deal = db.prepare(`SELECT d.responsible,a.name AS account_name FROM deals d JOIN accounts a ON a.id=d.account_id WHERE d.id=?`).get(req.params.id); if (deal) { const due = new Date(); due.setDate(due.getDate()+(FOLLOWUP_DAYS[actionType]||7)); task = db.prepare('SELECT * FROM tasks WHERE id=?').get(db.prepare('INSERT INTO tasks (title,responsible,due_date,priority) VALUES (?,?,?,?)').run(`Follow up on ${actionType} — ${deal.account_name} (${market})`, deal.responsible, due.toISOString().split('T')[0], 'Medium').lastInsertRowid); } } if (notes) { const deal = db.prepare('SELECT account_id,responsible FROM deals WHERE id=?').get(req.params.id); if (deal) db.prepare('INSERT INTO notes (account_id,author,text,date) VALUES (?,?,?,?)').run(deal.account_id, deal.responsible, notes, today); } res.json({ ok: true, task }); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+app.get('/api/tasks', (req, res) => { try { const db = getDb(); const { responsible, done } = req.query; let q = `SELECT t.*,u.name AS responsible_name,u.color AS responsible_color,a.name AS account_name FROM tasks t JOIN users u ON u.id=t.responsible LEFT JOIN accounts a ON a.id=t.account_id WHERE 1=1`; const p = []; if (responsible!==undefined){q+=' AND t.responsible=?';p.push(responsible);} if (done!==undefined){q+=' AND t.done=?';p.push(done==='1'?1:0);} q+=' ORDER BY t.due_date ASC,t.priority DESC'; res.json(db.prepare(q).all(...p)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post('/api/tasks', (req, res) => { try { const db = getDb(); const { account_id, title, responsible, due_date, priority } = req.body; if (!title||!responsible) return res.status(400).json({ error: 'title and responsible required' }); res.status(201).json(db.prepare('SELECT * FROM tasks WHERE id=?').get(db.prepare('INSERT INTO tasks (account_id,title,responsible,due_date,priority) VALUES (?,?,?,?,?)').run(account_id||null, title, responsible, due_date||null, priority||'Medium').lastInsertRowid)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.put('/api/tasks/:id', (req, res) => { try { const db = getDb(); const { title, responsible, due_date, priority, done, account_id } = req.body; db.prepare(`UPDATE tasks SET title=COALESCE(?,title),responsible=COALESCE(?,responsible),due_date=COALESCE(?,due_date),priority=COALESCE(?,priority),done=COALESCE(?,done),account_id=COALESCE(?,account_id) WHERE id=?`).run(title||null, responsible||null, due_date||null, priority||null, done!==undefined?(done?1:0):null, account_id!==undefined?account_id:null, req.params.id); res.json(db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.delete('/api/tasks/:id', (req, res) => { try { getDb().prepare('DELETE FROM tasks WHERE id=?').run(req.params.id); res.json({ ok: true }); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+app.get('/api/notes', (req, res) => { try { const db = getDb(); const { account_id } = req.query; let q = `SELECT n.*,u.name AS author_name,u.color AS author_color,a.name AS account_name FROM notes n JOIN users u ON u.id=n.author JOIN accounts a ON a.id=n.account_id WHERE 1=1`; const p = []; if (account_id){q+=' AND n.account_id=?';p.push(account_id);} q+=' ORDER BY n.date DESC,n.id DESC'; res.json(db.prepare(q).all(...p)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post('/api/notes', (req, res) => { try { const db = getDb(); const { account_id, author, text, date } = req.body; if (!account_id||!author||!text) return res.status(400).json({ error: 'account_id, author, and text required' }); res.status(201).json(db.prepare('SELECT * FROM notes WHERE id=?').get(db.prepare('INSERT INTO notes (account_id,author,text,date) VALUES (?,?,?,?)').run(account_id, author, text, date||new Date().toISOString().split('T')[0]).lastInsertRowid)); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.delete('/api/notes/:id', (req, res) => { try { getDb().prepare('DELETE FROM notes WHERE id=?').run(req.params.id); res.json({ ok: true }); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+app.get('/api/users', (req, res) => { try { res.json(getDb().prepare('SELECT id,name,email,role,color FROM users ORDER BY name').all()); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+app.post('/api/prospecting/research', async (req, res) => { const apiKey = process.env.PERPLEXITY_API_KEY; if (!apiKey) return res.status(503).json({ error: 'Prospecting not configured' }); const { company } = req.body; if (!company) return res.status(400).json({ error: 'company is required' }); res.status(503).json({ error: 'Prospecting not configured', hint: 'Add PERPLEXITY_API_KEY to environment' }); });
+
+app.post('/api/prospecting/add-to-crm', (req, res) => { try { const db = getDb(); const { company, website, contactName, contactRole, contactEmail } = req.body; if (!company) return res.status(400).json({ error: 'company is required' }); const uid = (req.session&&req.session.userId)||req.cookies?.samecrm_uid||req.headers['x-user-id']; const responsibleId = uid || db.prepare('SELECT id FROM users ORDER BY id LIMIT 1').get()?.id; if (!responsibleId) return res.status(500).json({ error: 'No users found' }); const existing = db.prepare('SELECT * FROM accounts WHERE name=?').get(company); if (existing) return res.status(409).json({ error: 'already_exists', account: existing }); const accountId = db.prepare('INSERT INTO accounts (name,website) VALUES (?,?)').run(company, website||null).lastInsertRowid; const dealId = db.prepare('INSERT INTO deals (account_id,responsible,type_of_goods,competition) VALUES (?,?,?,?)').run(accountId, responsibleId, 'Unknown', null).lastInsertRowid; db.prepare('INSERT INTO deal_markets (deal_id,market,stage) VALUES (?,?,?)').run(dealId, 'RO', 'Lead'); const due = new Date(); due.setDate(due.getDate()+7); const task = db.prepare('SELECT * FROM tasks WHERE id=?').get(db.prepare('INSERT INTO tasks (account_id,title,responsible,due_date,priority) VALUES (?,?,?,?,?)').run(accountId, `Follow up with ${contactName||company} — intro outreach`, responsibleId, due.toISOString().slice(0,10), 'Medium').lastInsertRowid); if (contactName) db.prepare('INSERT INTO contacts (account_id,name,role,email) VALUES (?,?,?,?)').run(accountId, contactName, contactRole||null, contactEmail||null); res.json({ account: db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId), deal: db.prepare('SELECT * FROM deals WHERE id=?').get(dealId), task }); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+app.get('/api/dashboard/stats', (req, res) => {
+  try {
+    const db = getDb();
+    const userId = req.session.userId || req.cookies?.samecrm_uid || req.headers['x-user-id'];
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+    const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    const dir = user.role==='director'||user.role==='admin';
+    const totalAccounts = db.prepare('SELECT COUNT(*) as c FROM accounts').get().c;
+    const activeDeals = (dir ? db.prepare(`SELECT COUNT(DISTINCT d.id) as c FROM deals d JOIN deal_markets dm ON dm.deal_id=d.id WHERE dm.stage!='Lost'`).get() : db.prepare(`SELECT COUNT(DISTINCT d.id) as c FROM deals d JOIN deal_markets dm ON dm.deal_id=d.id WHERE dm.stage!='Lost' AND d.responsible=?`).get(userId)).c;
+    const liveMarkets = (dir ? db.prepare(`SELECT COUNT(*) as c FROM deal_markets WHERE stage='Live'`).get() : db.prepare(`SELECT COUNT(*) as c FROM deal_markets dm JOIN deals d ON d.id=dm.deal_id WHERE dm.stage='Live' AND d.responsible=?`).get(userId)).c;
+    const openTasks = (dir ? db.prepare(`SELECT COUNT(*) as c FROM tasks WHERE done=0`).get() : db.prepare(`SELECT COUNT(*) as c FROM tasks WHERE done=0 AND responsible=?`).get(userId)).c;
+    const totalVolume = (dir ? db.prepare(`SELECT COALESCE(SUM(est_sameday_volume),0) as v FROM deal_markets WHERE stage='Live'`).get() : db.prepare(`SELECT COALESCE(SUM(dm.est_sameday_volume),0) as v FROM deal_markets dm JOIN deals d ON d.id=dm.deal_id WHERE dm.stage='Live' AND d.responsible=?`).get(userId)).v;
+    const openTasksList = dir ? db.prepare(`SELECT t.id,t.title,t.priority,t.due_date as dueDate,a.name as accountName FROM tasks t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.done=0 ORDER BY t.due_date ASC LIMIT 5`).all() : db.prepare(`SELECT t.id,t.title,t.priority,t.due_date as dueDate,a.name as accountName FROM tasks t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.done=0 AND t.responsible=? ORDER BY t.due_date ASC LIMIT 5`).all(userId);
+    const recentNotes = db.prepare(`SELECT n.id,n.text as content,n.date as createdAt,u.name as authorName,u.color as authorColor,a.name as accountName FROM notes n JOIN users u ON u.id=n.author JOIN accounts a ON a.id=n.account_id ORDER BY n.date DESC,n.id DESC LIMIT 3`).all();
+    res.json({ totalAccounts, activeDeals, liveMarkets, openTasks, totalVolume, openTasksList, recentNotes });
+  } catch (err) { console.error('Dashboard stats error:', err.message); res.status(500).json({ error: err.message }); }
+});
 
 const publicPath = __dirname;
 app.use(express.static(publicPath));
-app.get('*', (req, res) => {
-  if (!req.path.startsWith('/api')) {
-    res.sendFile(path.join(publicPath, 'index.html'));
-  }
-});
+app.get('*', (req, res) => { if (!req.path.startsWith('/api')) { res.sendFile(path.join(publicPath, 'index.html')); } });
 
-if (cron) {
-  try {
-    cron.schedule('0 6 * * 1-5', async () => {
-      try {
-        const { sendDailyReminders } = require('./routes/email');
-        await sendDailyReminders();
-      } catch(e) {
-        console.error('Cron job error:', e.message);
-      }
-    }, { timezone: 'Europe/Bucharest' });
-  } catch(e) {
-    console.warn('Cron setup failed:', e.message);
-  }
-}
+if (cron) { try { cron.schedule('0 6 * * 1-5', async () => { console.log('Daily reminder cron fired'); }, { timezone: 'Europe/Bucharest' }); } catch(e) { console.warn('Cron setup failed:', e.message); } }
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SameCRM running on port ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => { console.log(`SameCRM running on port ${PORT}`); });
