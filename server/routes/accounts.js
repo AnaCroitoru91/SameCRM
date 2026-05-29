@@ -12,10 +12,10 @@ router.get('/', (req, res) => {
       FROM accounts a ORDER BY a.name
     `).all();
     for (const acc of accounts) {
-      acc.markets = db.prepare(`
-        SELECT DISTINCT dm.market FROM deal_markets dm
-        JOIN deals d ON d.id = dm.deal_id WHERE d.account_id = ?
-      `).all(acc.id).map(r => r.market);
+     acc.markets = db.prepare(`
+  SELECT DISTINCT dm.market FROM deal_markets dm
+  JOIN deals d ON d.id = dm.deal_id WHERE d.account_id = ?
+`).all(acc.id).map(r => r.market).join(', ');
       acc.owners = db.prepare(`
         SELECT DISTINCT u.id, u.name, u.color FROM users u
         JOIN deals d ON d.responsible = u.id WHERE d.account_id = ?
@@ -31,7 +31,10 @@ router.get('/:id', (req, res) => {
     const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
     if (!account) return res.status(404).json({ error: 'Not found' });
     account.contacts = db.prepare('SELECT * FROM contacts WHERE account_id = ?').all(account.id);
-    account.deals = db.prepare('SELECT * FROM deals WHERE account_id = ?').all(account.id);
+    account.deals = db.prepare('SELECT * FROM deals WHERE account_id = ?').all(account.id).map(deal => ({
+  ...deal,
+  markets: db.prepare('SELECT market FROM deal_markets WHERE deal_id = ?').all(deal.id).map(m => m.market).join(', ')
+}));
     res.json(account);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
